@@ -1,78 +1,83 @@
-// Package pipeline wires together the watcher, parser, baseline, sampler,
-// alert notifier, and report recorder into a single cohesive run loop.
+// Package pipeline wires together the watcher, parser, filter, baseline,
+// throttle, formatter, and alert components into a single processing loop.
 package pipeline
 
 import (
 	"context"
 	"fmt"
-	"time"
+	"io"
 
 	"github.com/yourorg/logdrift/internal/alert"
 	"github.com/yourorg/logdrift/internal/baseline"
+	"github.com/yourorg/logdrift/internal/metrics"
 	"github.com/yourorg/logdrift/internal/parser"
-	"github.com/yourorg/logdrift/internal/report"
-	"github.com/yourorg/logdrift/internal/sampler"
 )
 
-// Pipeline orchestrates log ingestion, anomaly detection, and alerting.
-type Pipeline struct {
-	window   int
-	thresh   float64
-	cooldown time.Duration
-	notifier *alert.Notifier
-	recorder *report.Recorder
+// Notifier is the sink for anomaly alerts.
+type Notifier interface {
+	Notify(a alert.Alert)
 }
 
-// New constructs a Pipeline. window must be >= 2.
-func New(window int, thresh float64, cooldown time.Duration, n *alert.Notifier, rec *report.Recorder) (*Pipeline, error) {
+// Pipeline processes log lines from a channel and emits alerts.
+type Pipeline struct {
+	window   int
+	stdDev   float64
+	notifier Notifier
+	registry *metrics.Registry
+}
+
+// New creates a Pipeline. window must be >= 2.
+func New(window int, threshold float64, n Notifier) (*Pipeline, error) {
 	if window < 2 {
 		return nil, fmt.Errorf("pipeline: window must be >= 2, got %d", window)
 	}
 	return &Pipeline{
 		window:   window,
-		thresh:   thresh,
-		cooldown: cooldown,
+		stdDev:   threshold,
 		notifier: n,
-		recorder: rec,
+		registry: metrics.NewRegistry(),
 	}, nil
 }
 
-// Run consumes lines from the channel until it is closed or ctx is cancelled.
-// Each line is parsed; valid lines with latency are evaluated against a rolling
-// baseline. Anomalies trigger an alert (subject to sampler cooldown).
-func (p *Pipeline) Run(ctx context.Context, lines <-chan string) {
-	stats := make(map[string]*baseline.RollingStats)
-	samp := sampler.New(p.cooldown)
+// Registry returns the internal metrics registry for inspection.
+func (p *Pipeline) Registry() *metrics.Registry { return p.registry }
+
+// Run reads lines from src until it is closed or ctx is cancelled.
+func (p *Pipeline) Run(ctx context.Context, src <-chan string, w io.Writer) error {
+	stats, err := baseline.NewRollingStats(p.window)
+	if err != nil {
+		return err
+	}
+	parsed := p.registry.Counter("lines.parsed")
+	skipped := p.registry.Counter("lines.skipped")
+	anomalous := p.registry.Counter("lines.anomalous")
 
 	for {
 		select {
 		case <-ctx.Done():
-			return
-		case line, ok := <-lines:
+			return nil
+		case line, ok := <-src:
 			if !ok {
-				return
+				return nil
 			}
 			entry, err := parser.Parse(line)
 			if err != nil {
-				p.recorder.IncSkipped()
+				skipped.Inc()
 				continue
 			}
-			p.recorder.IncProcessed()
+			parsed.Inc()
 			if entry.Latency == 0 {
 				continue
 			}
-			key := entry.Method + " " + entry.Path
-			rs, exists := stats[key]
-			if !exists {
-				rs, _ = baseline.NewRollingStats(p.window)
-				stats[key] = rs
-			}
-			rs.Add(entry.Latency)
-			if rs.IsAnomaly(entry.Latency, p.thresh) && samp.Allow(key) {
-				a := alert.NewAlert(key, entry.Latency, rs)
+			v := entry.Latency
+			if stats.IsAnomaly(v, p.stdDev) {
+				anomalous.Inc()
+				a := alert.NewAlert(entry.Level, fmt.Sprintf(
+					"latency %.2fms exceeds %.1f sigma baseline", v, p.stdDev,
+				))
 				p.notifier.Notify(a)
-				p.recorder.RecordAlert(key)
 			}
+			stats.Add(v)
 		}
 	}
 }

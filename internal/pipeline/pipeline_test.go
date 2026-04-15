@@ -1,77 +1,83 @@
 package pipeline_test
 
 import (
-	"bytes"
-	"strings"
+	"context"
+	"io"
+	"sync"
 	"testing"
 
-	"github.com/user/logdrift/internal/alert"
-	"github.com/user/logdrift/internal/pipeline"
+	"github.com/yourorg/logdrift/internal/alert"
+	"github.com/yourorg/logdrift/internal/pipeline"
 )
 
-func newTestNotifier(buf *bytes.Buffer) *alert.Notifier {
-	return alert.NewNotifier(buf)
+type testNotifier struct {
+	mu     sync.Mutex
+	alerts []alert.Alert
+}
+
+func newTestNotifier() *testNotifier { return &testNotifier{} }
+func (n *testNotifier) Notify(a alert.Alert) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.alerts = append(n.alerts, a)
+}
+func (n *testNotifier) Len() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return len(n.alerts)
 }
 
 func TestPipeline_New_InvalidWindow(t *testing.T) {
-	_, err := pipeline.New(pipeline.Config{
-		WindowSize: 0,
-		Threshold:  2.0,
-		Notifier:   newTestNotifier(&bytes.Buffer{}),
-	})
+	_, err := pipeline.New(1, 2.0, newTestNotifier())
 	if err == nil {
-		t.Fatal("expected error for window size 0, got nil")
+		t.Fatal("expected error for window < 2")
 	}
 }
 
 func TestPipeline_Run_NoLines(t *testing.T) {
-	buf := &bytes.Buffer{}
-	p, err := pipeline.New(pipeline.Config{
-		WindowSize: 10,
-		Threshold:  2.0,
-		Notifier:   newTestNotifier(buf),
-	})
-	if err != nil {
+	n := newTestNotifier()
+	p, _ := pipeline.New(5, 2.0, n)
+	ch := make(chan string)
+	close(ch)
+	if err := p.Run(context.Background(), ch, io.Discard); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if err := p.Run(strings.NewReader("")); err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-	if buf.Len() != 0 {
-		t.Errorf("expected no alerts, got: %s", buf.String())
+	if n.Len() != 0 {
+		t.Fatalf("expected 0 alerts, got %d", n.Len())
 	}
 }
 
 func TestPipeline_Run_SkipsInvalidLines(t *testing.T) {
-	buf := &bytes.Buffer{}
-	p, _ := pipeline.New(pipeline.Config{
-		WindowSize: 10,
-		Threshold:  2.0,
-		Notifier:   newTestNotifier(buf),
-	})
-	input := "not a valid log line\nalso invalid\n"
-	if err := p.Run(strings.NewReader(input)); err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-	if buf.Len() != 0 {
-		t.Errorf("expected no alerts for invalid lines, got: %s", buf.String())
+	n := newTestNotifier()
+	p, _ := pipeline.New(5, 2.0, n)
+	ch := make(chan string, 2)
+	ch <- "not a log line"
+	ch <- "also bad"
+	close(ch)
+	p.Run(context.Background(), ch, io.Discard) //nolint:errcheck
+	snap := p.Registry().Snapshot()
+	if snap["lines.skipped"] != 2 {
+		t.Fatalf("expected 2 skipped, got %d", snap["lines.skipped"])
 	}
 }
 
 func TestPipeline_Run_EmitsAlertOnAnomaly(t *testing.T) {
-	buf := &bytes.Buffer{}
-	p, _ := pipeline.New(pipeline.Config{
-		WindowSize: 10,
-		Threshold:  1.0,
-		Notifier:   newTestNotifier(buf),
-	})
-	// Feed normal lines to build baseline, then one spike
-	normal := strings.Repeat("2024-01-01T00:00:00Z INFO request latency=10ms\n", 8)
-	spike := "2024-01-01T00:00:01Z ERROR request latency=9999ms\n"
-	if err := p.Run(strings.NewReader(normal + spike)); err != nil {
-		t.Fatalf("Run returned error: %v", err)
+	n := newTestNotifier()
+	p, _ := pipeline.New(4, 1.0, n)
+	ch := make(chan string, 10)
+	// Seed baseline with consistent latency then spike.
+	for _, l := range []string{
+		`2024-01-01T00:00:00Z INFO  GET /a latency=10ms`,
+		`2024-01-01T00:00:01Z INFO  GET /b latency=11ms`,
+		`2024-01-01T00:00:02Z INFO  GET /c latency=10ms`,
+		`2024-01-01T00:00:03Z INFO  GET /d latency=10ms`,
+		`2024-01-01T00:00:04Z ERROR GET /e latency=9999ms`,
+	} {
+		ch <- l
 	}
-	if buf.Len() == 0 {
-		t.Error("expected at least one alert for spike latency, got none")
+	close(ch)
+	p.Run(context.Background(), ch, io.Discard) //nolint:errcheck
+	if n.Len() == 0 {
+		t.Fatal("expected at least one anomaly alert")
 	}
 }
