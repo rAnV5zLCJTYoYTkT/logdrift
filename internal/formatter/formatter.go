@@ -63,14 +63,28 @@ func (f *Formatter) Render(e Entry) string {
 		}
 		fallthrough
 	default:
-		return fmt.Sprintf(
-			"[%s] %s | z=%.2f mean=%.2f stddev=%.2f | %s",
-			e.Timestamp.UTC().Format(time.RFC3339),
-			e.Level,
-			e.ZScore,
-			e.Mean,
-			e.StdDev,
-			e.Message,
-		)
+		return renderText(e)
 	}
+}
+
+// RenderAll renders a slice of entries, one per line.
+func (f *Formatter) RenderAll(entries []Entry) string {
+	lines := make([]string, len(entries))
+	for i, e := range entries {
+		lines[i] = f.Render(e)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderText formats an Entry as a plain-text line.
+func renderText(e Entry) string {
+	return fmt.Sprintf(
+		"[%s] %s | z=%.2f mean=%.2f stddev=%.2f | %s",
+		e.Timestamp.UTC().Format(time.RFC3339),
+		e.Level,
+		e.ZScore,
+		e.Mean,
+		e.StdDev,
+		e.Message,
+	)
 }
