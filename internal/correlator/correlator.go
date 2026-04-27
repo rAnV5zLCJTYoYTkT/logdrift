@@ -75,3 +75,17 @@ func (c *Correlator) Len() int {
 	defer c.mu.Unlock()
 	return len(c.groups)
 }
+
+// Get returns a copy of the group for the given key and whether it was found.
+// The returned group is a snapshot; subsequent Add calls are not reflected.
+func (c *Correlator) Get(key string) (Group, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	g, ok := c.groups[key]
+	if !ok {
+		return Group{}, false
+	}
+	copy := *g
+	copy.Entries = append([]Entry(nil), g.Entries...)
+	return copy, true
+}
