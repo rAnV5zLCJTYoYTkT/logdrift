@@ -45,3 +45,10 @@ func (s *Splitter) Split(line string) map[string]string {
 	}
 	return out
 }
+
+// Fields returns a copy of the field names configured for this Splitter.
+func (s *Splitter) Fields() []string {
+	copy := make([]string, len(s.fields))
+	copy(copy, s.fields)
+	return copy
+}
